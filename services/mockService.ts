@@ -118,9 +118,29 @@ export const fetchLibrary = async (): Promise<LibraryEntry[]> => {
   }));
 };
 
+// Check if user has solved Cloudflare challenge
+const checkCloudflareBypass = (url: string): string | null => {
+  const bypassKey = `cf_bypass_${btoa(url).slice(0, 20)}`;
+  return localStorage.getItem(bypassKey);
+};
+
+// Store Cloudflare bypass token
+const storeCloudflareBypass = (url: string, token: string) => {
+  const bypassKey = `cf_bypass_${btoa(url).slice(0, 20)}`;
+  localStorage.setItem(bypassKey, token);
+};
+
 // Simulate scraping a novel from a URL
-export const fetchNovelFromUrl = async (url: string): Promise<Novel> => {
+export const fetchNovelFromUrl = async (url: string, isRetry = false): Promise<Novel> => {
   await new Promise(resolve => setTimeout(resolve, 1500)); // Simulate network request
+  
+  // Check if user has bypass token (but not on retry to avoid infinite loop)
+  if (!isRetry) {
+    const bypassToken = checkCloudflareBypass(url);
+    if (bypassToken) {
+      console.log('[Cloudflare] Using stored bypass token');
+    }
+  }
 
   // Ranobes Parsing Logic
   if (url.includes('ranobes.net')) {
@@ -145,23 +165,100 @@ export const fetchNovelFromUrl = async (url: string): Promise<Novel> => {
 
     try {
       console.log(`[Proxy] Fetching URL: ${url}`);
-      // Try CodeTabs proxy as it often handles basic protections better
-      const proxyUrl = `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`;
-      const response = await fetch(proxyUrl);
-      console.log(`[Proxy] Response status: ${response.status}`);
+      
+      // Try local proxy first, then fallback to public proxies
+      const proxies = [
+        `http://localhost:3001/proxy?url=${encodeURIComponent(url)}`,
+        `https://api.allorigins.win/get?url=${encodeURIComponent(url)}`
+      ];
+      
+      let html = '';
+      
+      for (const proxyUrl of proxies) {
+        try {
+          console.log(`[Proxy] Trying: ${proxyUrl.split('?')[0]}`);
+          // Simple request to avoid CORS preflight
+          const response = await fetch(proxyUrl);
+          
+          if (response.ok) {
+            let testHtml = '';
+            if (proxyUrl.includes('allorigins')) {
+              const data = await response.json();
+              testHtml = data.contents;
+            } else {
+              testHtml = await response.text();
+            }
+            
+            // Test if this proxy bypassed Cloudflare
+            const parser = new DOMParser();
+            const testDoc = parser.parseFromString(testHtml, "text/html");
+            
+            if (testDoc.title.includes("Just a moment") || testDoc.title.includes("Attention Required") || testHtml.includes('cf-browser-verification')) {
+              console.warn(`[Proxy] ${proxyUrl.split('?')[0]} returned Cloudflare challenge, trying next...`);
+              continue;
+            }
+            
+            html = testHtml;
+            console.log(`[Proxy] Success with ${proxyUrl.split('?')[0]}`);
+            break;
+          }
+        } catch (e) {
+          console.warn(`[Proxy] Failed with ${proxyUrl.split('?')[0]}:`, e);
+          continue;
+        }
+      }
+      
+      if (!html) {
+        // Open page for manual Cloudflare bypass
+        console.log('[Cloudflare] Opening page for manual bypass...');
+        
+        const popup = window.open(url, 'cloudflareBypass', 'width=800,height=600');
+        
+        alert(
+          'Cloudflare protection detected!\n\n' +
+          'A new window has opened. Please:\n' +
+          '1. Complete any CAPTCHA or challenge\n' +
+          '2. Wait for the page to load fully\n' +
+          '3. Close the popup window\n\n' +
+          'The import will retry automatically.'
+        );
+        
+        // Wait for user to close popup
+        await new Promise((resolve) => {
+          const checkInterval = setInterval(() => {
+            if (popup?.closed) {
+              clearInterval(checkInterval);
+              resolve(null);
+            }
+          }, 1000);
+        });
+        
+        // Retry with proxies after user completes challenge
+        console.log('[Cloudflare] Retrying after manual bypass...');
+        for (const proxyUrl of proxies) {
+          try {
+            const response = await fetch(proxyUrl);
+            if (response.ok) {
+              const data = await response.json();
+              html = data.contents;
+              break;
+            }
+          } catch (e) {
+            continue;
+          }
+        }
+        
+        if (!html) {
+          throw new Error('Cloudflare bypass failed - please try again');
+        }
+      }
+      
+      console.log(`[Proxy] HTML received, length: ${html.length}`);
 
-      if (response.ok) {
-        const html = await response.text();
-        console.log(`[Proxy] HTML received, length: ${html.length}`);
-
+      if (html) {
         const parser = new DOMParser();
         const doc = parser.parseFromString(html, "text/html");
         console.log(`[DOM] Document title: ${doc.title}`);
-
-        if (doc.title.includes("Just a moment") || doc.title.includes("Attention Required")) {
-          console.warn("[Proxy] Cloudflare/Bot protection detected. Cannot parse actual content.");
-          throw new Error("Cloudflare blocked");
-        }
 
         // Extract Image using multiple strategies
         let foundImage: string | null = null;
@@ -229,10 +326,13 @@ export const fetchNovelFromUrl = async (url: string): Promise<Novel> => {
         }
 
         if (foundImage) {
-          coverUrl = foundImage;
+          // Clean up quotes and escape characters from the URL
+          coverUrl = foundImage.replace(/["'\\]/g, '').replace(/&quot;/g, '');
           // Fix relative URLs
           if (coverUrl.startsWith('/')) {
             coverUrl = `https://ranobes.net${coverUrl}`;
+          } else if (!coverUrl.startsWith('http')) {
+            coverUrl = `https://ranobes.net/${coverUrl}`;
           }
           console.log(`[Image Extraction] Final cover URL: ${coverUrl}`);
         } else {
@@ -311,10 +411,17 @@ export const fetchNovelFromUrl = async (url: string): Promise<Novel> => {
           // Use the Ranobes parser to fetch all chapters
           const { fetchAllRanobesChapters, parseChaptersFromHTML } = await import('./ranobesParser');
 
-          // Create a proxy function for the parser
+          // Create a proxy function using local proxy
           const proxyFn = async (url: string) => {
-            const proxyUrl = `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`;
-            return await fetch(proxyUrl);
+            const response = await fetch(`http://localhost:3001/proxy?url=${encodeURIComponent(url)}`);
+            if (response.ok) {
+              const data = await response.json();
+              return {
+                ok: true,
+                text: () => Promise.resolve(data.contents)
+              };
+            }
+            throw new Error('Chapter proxy failed');
           };
 
           parsedChapters = await fetchAllRanobesChapters(tocUrl, proxyFn);
@@ -330,9 +437,6 @@ export const fetchNovelFromUrl = async (url: string): Promise<Novel> => {
         } catch (e) {
           console.warn("[Chapter Parsing] Error:", e);
         }
-      } else {
-        console.error(`[Proxy] Failed to fetch. Status: ${response.status}`);
-        throw new Error(`Proxy status: ${response.status}`);
       }
     } catch (error) {
       console.error("Failed to fetch or parse novel page:", error);
@@ -418,11 +522,28 @@ export const fetchChapter = async (chapterNumber: number, novelId?: string): Pro
     if (chapterUrl && chapterUrl.includes('ranobes.net')) {
       try {
         console.log(`[Chapter Fetch] Fetching chapter from: ${chapterUrl}`);
-        const proxyUrl = `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(chapterUrl)}`;
-        const response = await fetch(proxyUrl);
+        
+        const proxies = [
+          `http://localhost:3001/proxy?url=${encodeURIComponent(chapterUrl)}`
+        ];
+        
+        let html = '';
+        
+        for (const proxyUrl of proxies) {
+          try {
+            const response = await fetch(proxyUrl);
+            
+            if (response.ok) {
+              const data = await response.json();
+              html = data.contents;
+              break;
+            }
+          } catch (e) {
+            continue;
+          }
+        }
 
-        if (response.ok) {
-          const html = await response.text();
+        if (html) {
           const parser = new DOMParser();
           const doc = parser.parseFromString(html, "text/html");
 
@@ -453,8 +574,6 @@ export const fetchChapter = async (chapterNumber: number, novelId?: string): Pro
 
             console.log(`[Chapter Fetch] Extracted ${content.length} paragraphs`);
           }
-        } else {
-          console.warn(`[Chapter Fetch] Failed to fetch chapter: ${response.status}`);
         }
       } catch (error) {
         console.error("[Chapter Fetch] Error fetching chapter content:", error);

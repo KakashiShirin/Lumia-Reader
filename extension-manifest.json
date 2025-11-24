@@ -1,0 +1,14 @@
+{
+  "manifest_version": 3,
+  "name": "Lumia Reader Helper",
+  "version": "1.0",
+  "permissions": ["activeTab", "scripting"],
+  "host_permissions": ["https://ranobes.net/*"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [{
+    "matches": ["http://localhost:3000/*"],
+    "js": ["content.js"]
+  }]
+}
