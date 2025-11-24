@@ -394,14 +394,12 @@ const generateComments = (count: number): Comment[] => {
 };
 
 export const fetchChapter = async (chapterNumber: number, novelId?: string): Promise<Chapter> => {
-  // Simulate network delay
-  await new Promise(resolve => setTimeout(resolve, 600));
-
-  let title = TITLES[(chapterNumber - 1) % TITLES.length] || `Chapter ${chapterNumber}`;
-  let content = [...LOREM_PARAGRAPHS]; // Default fallback
+  let title = `Chapter ${chapterNumber}`;
+  let content: string[] = [];
+  let chapterUrl = '';
 
   if (novelId) {
-    // 1. Check Local Storage for TOC
+    // 1. Check Local Storage for TOC to get the chapter URL
     const storedToc = localStorage.getItem(`lumina_toc_${novelId}`);
     if (storedToc) {
       try {
@@ -409,19 +407,64 @@ export const fetchChapter = async (chapterNumber: number, novelId?: string): Pro
         const item = toc.find(t => t.number === chapterNumber);
         if (item) {
           title = item.title;
+          chapterUrl = item.url || '';
         }
       } catch (e) {
         console.error("Failed to parse stored TOC", e);
       }
     }
 
-    // Generate random content length
-    content = [];
-    const paraCount = 15 + Math.floor(Math.random() * 10);
-    for (let i = 0; i < paraCount; i++) {
-      const p1 = LOREM_PARAGRAPHS[Math.floor(Math.random() * LOREM_PARAGRAPHS.length)];
-      content.push(`${p1}`);
+    // 2. If we have a chapter URL, fetch the actual content
+    if (chapterUrl && chapterUrl.includes('ranobes.net')) {
+      try {
+        console.log(`[Chapter Fetch] Fetching chapter from: ${chapterUrl}`);
+        const proxyUrl = `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(chapterUrl)}`;
+        const response = await fetch(proxyUrl);
+
+        if (response.ok) {
+          const html = await response.text();
+          const parser = new DOMParser();
+          const doc = parser.parseFromString(html, "text/html");
+
+          // Extract title from h1.title
+          const titleElement = doc.querySelector('h1.title[itemprop="headline"]');
+          if (titleElement) {
+            // Get just the chapter title, remove the novel name part
+            const fullTitle = titleElement.textContent?.trim() || '';
+            const titleParts = fullTitle.split('|');
+            title = titleParts[0]?.trim() || title;
+            console.log(`[Chapter Fetch] Extracted title: ${title}`);
+          }
+
+          // Extract content from div.text#arrticle
+          const contentElement = doc.querySelector('div.text#arrticle');
+          if (contentElement) {
+            // Get all paragraphs, filtering out ads and scripts
+            const paragraphs = contentElement.querySelectorAll('p');
+            content = Array.from(paragraphs)
+              .map(p => p.textContent?.trim() || '')
+              .filter(text => {
+                // Filter out empty paragraphs and ad-related content
+                return text.length > 0 &&
+                  !text.includes('data-cfasync') &&
+                  !text.includes('script') &&
+                  text.length > 10; // Minimum length to avoid ad fragments
+              });
+
+            console.log(`[Chapter Fetch] Extracted ${content.length} paragraphs`);
+          }
+        } else {
+          console.warn(`[Chapter Fetch] Failed to fetch chapter: ${response.status}`);
+        }
+      } catch (error) {
+        console.error("[Chapter Fetch] Error fetching chapter content:", error);
+      }
     }
+  }
+
+  // If no content was fetched, show a message instead of placeholder
+  if (content.length === 0) {
+    content = ["Unable to load chapter content. Please check your connection or try again later."];
   }
 
   return {
