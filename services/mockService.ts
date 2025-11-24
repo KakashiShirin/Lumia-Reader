@@ -303,72 +303,27 @@ export const fetchNovelFromUrl = async (url: string): Promise<Novel> => {
         // --- Chapter List Parsing ---
         try {
           // Look for "More chapters" link
-          const moreChaptersLink = doc.querySelector('.r-fullstory-chapters-foot a[href*="/chapters/"]');
-          let tocUrl = moreChaptersLink ? moreChaptersLink.getAttribute('href') : null;
+          // Construct TOC URL directly from novel ID
+          const tocUrl = `https://ranobes.net/chapters/${id}/`;
 
-          if (tocUrl) {
-            if (tocUrl.startsWith('/')) tocUrl = `https://ranobes.net${tocUrl}`;
-            console.log(`[Chapter Parsing] Found TOC URL: ${tocUrl}`);
+          console.log(`[Chapter Parsing] Constructed TOC URL: ${tocUrl}`);
 
-            // Fetch the TOC page
-            const tocProxyUrl = `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(tocUrl)}`;
-            const tocResponse = await fetch(tocProxyUrl);
-            if (tocResponse.ok) {
-              const tocHtml = await tocResponse.text();
-              const tocDoc = new DOMParser().parseFromString(tocHtml, "text/html");
+          // Use the Ranobes parser to fetch all chapters
+          const { fetchAllRanobesChapters, parseChaptersFromHTML } = await import('./ranobesParser');
 
-              // Parse chapters from TOC page
-              const chapterLinks = tocDoc.querySelectorAll('.chapters-scroll-list li a');
-              if (chapterLinks.length > 0) {
-                console.log(`[Chapter Parsing] Found ${chapterLinks.length} chapters on TOC page.`);
-                parsedChapters = Array.from(chapterLinks).map((link) => {
-                  const titleSpan = link.querySelector('.title');
-                  const titleText = titleSpan?.textContent?.trim() || "";
-                  const href = link.getAttribute('href') || '';
+          // Create a proxy function for the parser
+          const proxyFn = async (url: string) => {
+            const proxyUrl = `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`;
+            return await fetch(proxyUrl);
+          };
 
-                  // Extract number from title
-                  const numMatch = titleText.match(/Chapter (\d+)/i);
-                  const number = numMatch ? parseInt(numMatch[1]) : 0;
+          parsedChapters = await fetchAllRanobesChapters(tocUrl, proxyFn);
 
-                  return {
-                    number: number,
-                    title: titleText,
-                    url: href
-                  };
-                }).filter(ch => ch.number > 0); // Remove invalid chapters
-              }
-            } else {
-              console.warn(`[Chapter Parsing] Failed to fetch TOC page: ${tocResponse.status}`);
-            }
-          }
-
-          // Fallback: Parse from current page if TOC fetch failed
+          // If parsing failed, try HTML fallback from main page
           if (parsedChapters.length === 0) {
-            const chapterLinks = doc.querySelectorAll('.chapters-scroll-list li a');
-            if (chapterLinks.length > 0) {
-              console.log(`[Chapter Parsing] Found ${chapterLinks.length} chapters on main page (fallback).`);
-              parsedChapters = Array.from(chapterLinks).map((link) => {
-                const titleSpan = link.querySelector('.title');
-                const titleText = titleSpan?.textContent?.trim() || "";
-                const href = link.getAttribute('href') || '';
-
-                const numMatch = titleText.match(/Chapter (\d+)/i);
-                const number = numMatch ? parseInt(numMatch[1]) : 0;
-
-                return {
-                  number: number,
-                  title: titleText,
-                  url: href
-                };
-              }).filter(ch => ch.number > 0);
-            }
+            console.warn('[Chapter Parsing] JSON parsing failed, trying HTML fallback from main page');
+            parsedChapters = parseChaptersFromHTML(doc);
           }
-
-          // Sort by chapter number and deduplicate
-          parsedChapters.sort((a, b) => a.number - b.number);
-          parsedChapters = parsedChapters.filter((chapter, index, self) =>
-            index === self.findIndex((c) => c.number === chapter.number)
-          );
 
           console.log(`[Chapter Parsing] Final chapter count: ${parsedChapters.length}`);
 
