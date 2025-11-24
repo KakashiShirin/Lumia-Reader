@@ -138,6 +138,10 @@ export const fetchNovelFromUrl = async (url: string): Promise<Novel> => {
 
     let coverUrl = `https://ranobes.net/up/medium/${id}.jpg`; // Default fallback
     let description = "Su Chen traveled to a world where Vikings were prevalent..."; // Default fallback
+    let author = "Unknown"; // Default fallback
+    let rating = 0; // Default fallback
+    let status: "Ongoing" | "Completed" | "Hiatus" | "Dropped" = "Ongoing"; // Default fallback
+    let parsedChapters: TOCItem[] = [];
 
     try {
       console.log(`[Proxy] Fetching URL: ${url}`);
@@ -240,6 +244,137 @@ export const fetchNovelFromUrl = async (url: string): Promise<Novel> => {
         if (descMeta) {
           description = descMeta.getAttribute('content') || description;
         }
+
+        // --- Author Extraction ---
+        try {
+          const authorXPath = "/html/body/div[1]/div/div/div[2]/div/article/div[2]/div[1]/div/div[1]/div[3]/div[1]/div[2]/ul[1]/li[7]/span/a";
+          const authorResult = doc.evaluate(authorXPath, doc, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
+          const authorElement = authorResult.singleNodeValue as HTMLElement;
+          if (authorElement) {
+            author = authorElement.textContent?.trim() || author;
+            console.log(`[Author Extraction] Found: ${author}`);
+          }
+        } catch (e) {
+          console.warn("[Author Extraction] Error:", e);
+        }
+
+        // --- Rating Extraction ---
+        try {
+          const ratingXPath = "/html/body/div[1]/div/div/div[2]/div/article/div[2]/aside/div[1]/div[1]/div[2]/div[1]/div[1]/div/div/div/span[1]";
+          const ratingResult = doc.evaluate(ratingXPath, doc, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
+          const ratingElement = ratingResult.singleNodeValue as HTMLElement;
+          if (ratingElement) {
+            const ratingText = ratingElement.textContent?.trim();
+            const ratingValue = parseFloat(ratingText || '0');
+            if (!isNaN(ratingValue)) {
+              rating = ratingValue;
+              console.log(`[Rating Extraction] Found: ${rating}`);
+            }
+          }
+        } catch (e) {
+          console.warn("[Rating Extraction] Error:", e);
+        }
+
+        // --- Status Extraction ---
+        try {
+          const statusXPath = "/html/body/div[1]/div/div/div[2]/div/article/div[2]/div[1]/div/div[1]/div[3]/div[1]/div[2]/ul[1]/li[1]/span/a";
+          const statusResult = doc.evaluate(statusXPath, doc, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
+          const statusElement = statusResult.singleNodeValue as HTMLElement;
+          if (statusElement) {
+            const statusText = statusElement.textContent?.trim().toLowerCase() || "";
+            console.log(`[Status Extraction] Raw status: ${statusText}`);
+
+            // Normalize status to match our type
+            if (statusText.includes("complet")) {
+              status = "Completed";
+            } else if (statusText.includes("hiatus")) {
+              status = "Hiatus";
+            } else if (statusText.includes("drop")) {
+              status = "Dropped";
+            } else if (statusText.includes("ongoing") || statusText.includes("continu")) {
+              status = "Ongoing";
+            }
+            console.log(`[Status Extraction] Normalized status: ${status}`);
+          }
+        } catch (e) {
+          console.warn("[Status Extraction] Error:", e);
+        }
+
+        // --- Chapter List Parsing ---
+        try {
+          // Look for "More chapters" link
+          const moreChaptersLink = doc.querySelector('.r-fullstory-chapters-foot a[href*="/chapters/"]');
+          let tocUrl = moreChaptersLink ? moreChaptersLink.getAttribute('href') : null;
+
+          if (tocUrl) {
+            if (tocUrl.startsWith('/')) tocUrl = `https://ranobes.net${tocUrl}`;
+            console.log(`[Chapter Parsing] Found TOC URL: ${tocUrl}`);
+
+            // Fetch the TOC page
+            const tocProxyUrl = `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(tocUrl)}`;
+            const tocResponse = await fetch(tocProxyUrl);
+            if (tocResponse.ok) {
+              const tocHtml = await tocResponse.text();
+              const tocDoc = new DOMParser().parseFromString(tocHtml, "text/html");
+
+              // Parse chapters from TOC page
+              const chapterLinks = tocDoc.querySelectorAll('.chapters-scroll-list li a');
+              if (chapterLinks.length > 0) {
+                console.log(`[Chapter Parsing] Found ${chapterLinks.length} chapters on TOC page.`);
+                parsedChapters = Array.from(chapterLinks).map((link) => {
+                  const titleSpan = link.querySelector('.title');
+                  const titleText = titleSpan?.textContent?.trim() || "";
+                  const href = link.getAttribute('href') || '';
+
+                  // Extract number from title
+                  const numMatch = titleText.match(/Chapter (\d+)/i);
+                  const number = numMatch ? parseInt(numMatch[1]) : 0;
+
+                  return {
+                    number: number,
+                    title: titleText,
+                    url: href
+                  };
+                }).filter(ch => ch.number > 0); // Remove invalid chapters
+              }
+            } else {
+              console.warn(`[Chapter Parsing] Failed to fetch TOC page: ${tocResponse.status}`);
+            }
+          }
+
+          // Fallback: Parse from current page if TOC fetch failed
+          if (parsedChapters.length === 0) {
+            const chapterLinks = doc.querySelectorAll('.chapters-scroll-list li a');
+            if (chapterLinks.length > 0) {
+              console.log(`[Chapter Parsing] Found ${chapterLinks.length} chapters on main page (fallback).`);
+              parsedChapters = Array.from(chapterLinks).map((link) => {
+                const titleSpan = link.querySelector('.title');
+                const titleText = titleSpan?.textContent?.trim() || "";
+                const href = link.getAttribute('href') || '';
+
+                const numMatch = titleText.match(/Chapter (\d+)/i);
+                const number = numMatch ? parseInt(numMatch[1]) : 0;
+
+                return {
+                  number: number,
+                  title: titleText,
+                  url: href
+                };
+              }).filter(ch => ch.number > 0);
+            }
+          }
+
+          // Sort by chapter number and deduplicate
+          parsedChapters.sort((a, b) => a.number - b.number);
+          parsedChapters = parsedChapters.filter((chapter, index, self) =>
+            index === self.findIndex((c) => c.number === chapter.number)
+          );
+
+          console.log(`[Chapter Parsing] Final chapter count: ${parsedChapters.length}`);
+
+        } catch (e) {
+          console.warn("[Chapter Parsing] Error:", e);
+        }
       } else {
         console.error(`[Proxy] Failed to fetch. Status: ${response.status}`);
         throw new Error(`Proxy status: ${response.status}`);
@@ -254,9 +389,9 @@ export const fetchNovelFromUrl = async (url: string): Promise<Novel> => {
       }
     }
 
-    // Simulate building TOC
-    const totalChapters = 67;
-    const toc: TOCItem[] = Array.from({ length: totalChapters }, (_, i) => ({
+    // Use parsed chapters if available, otherwise fallback to mock
+    const totalChapters = parsedChapters.length > 0 ? parsedChapters.length : 67;
+    const toc: TOCItem[] = parsedChapters.length > 0 ? parsedChapters : Array.from({ length: totalChapters }, (_, i) => ({
       number: i + 1,
       title: `Chapter ${i + 1}`,
       url: `${url}/chapter-${i + 1}`
@@ -268,13 +403,13 @@ export const fetchNovelFromUrl = async (url: string): Promise<Novel> => {
     return {
       id: id,
       title: title,
-      author: "Unknown",
+      author: author,
       coverUrl: coverUrl,
       description: description,
       tags: ["Imported", "Fantasy", "History"],
-      status: "Ongoing",
+      status: status,
       totalChapters: totalChapters,
-      rating: 0
+      rating: rating
     };
   }
 

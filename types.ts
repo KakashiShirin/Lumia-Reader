@@ -55,7 +55,7 @@ export interface Novel {
   coverUrl: string;
   description: string;
   tags: string[];
-  status: 'Ongoing' | 'Completed' | 'Hiatus';
+  status: 'Ongoing' | 'Completed' | 'Hiatus' | 'Dropped';
   totalChapters: number;
   rating: number;
 }
