@@ -106,16 +106,55 @@ export const mockLogin = async (username: string): Promise<User> => {
 };
 
 export const fetchLibrary = async (): Promise<LibraryEntry[]> => {
-  // Initialize with some random progress and categories
   const categories = ['reading', 'plan', 'completed', 'dropped'];
 
-  return MOCK_NOVELS_DATA.map((novel, idx) => ({
+  // Start with mock novels
+  const mockNovels: LibraryEntry[] = MOCK_NOVELS_DATA.map((novel, idx) => ({
     ...novel,
     lastReadChapter: Math.floor(Math.random() * 10),
     readChapters: [],
     bookmarkedChapters: [],
     categoryId: categories[idx % categories.length]
   }));
+
+  // Load imported novels from storage
+  try {
+    // Fetch list of all stored novels from proxy server
+    const response = await fetch(`${PROXY_BASE}/store/list`);
+    if (response.ok) {
+      const { files } = await response.json();
+
+      // Filter for novel files (novel_*.json)
+      const novelFiles = files.filter((f: string) => f.startsWith('novel_') && f.endsWith('.json'));
+
+      // Load each novel
+      for (const file of novelFiles) {
+        const key = file.replace('.json', '');
+        const novelData = await fetchFromStore(key);
+
+        if (novelData) {
+          // Convert to LibraryEntry format
+          const libraryEntry: LibraryEntry = {
+            ...novelData,
+            lastReadChapter: 0,
+            readChapters: [],
+            bookmarkedChapters: [],
+            categoryId: 'reading', // Default to reading category
+            sourceUrl: `https://ranobes.net/novels/${novelData.id}-${novelData.title.toLowerCase().replace(/\s+/g, '-')}.html`
+          };
+
+          // Check if already in mock data (avoid duplicates)
+          if (!mockNovels.find(n => n.id === novelData.id)) {
+            mockNovels.push(libraryEntry);
+          }
+        }
+      }
+    }
+  } catch (e) {
+    console.warn('[Library] Failed to load imported novels:', e);
+  }
+
+  return mockNovels;
 };
 
 // Check if user has solved Cloudflare challenge
@@ -130,10 +169,85 @@ const storeCloudflareBypass = (url: string, token: string) => {
   localStorage.setItem(bypassKey, token);
 };
 
+// --- Rate Limiting Utilities ---
+const FETCH_DELAY_MIN_MS = 2000; // 2 seconds minimum
+const FETCH_DELAY_MAX_MS = 5000; // 5 seconds maximum
+
+const sleep = (ms: number): Promise<void> => {
+  return new Promise(resolve => setTimeout(resolve, ms));
+};
+
+const getRandomDelay = (): number => {
+  return Math.floor(Math.random() * (FETCH_DELAY_MAX_MS - FETCH_DELAY_MIN_MS + 1)) + FETCH_DELAY_MIN_MS;
+};
+
+let lastFetchTime = 0;
+
+const rateLimitedFetch = async (url: string, options?: RequestInit): Promise<Response> => {
+  const now = Date.now();
+  const timeSinceLastFetch = now - lastFetchTime;
+
+  if (timeSinceLastFetch < FETCH_DELAY_MIN_MS) {
+    const delay = getRandomDelay();
+    console.log(`[Rate Limit] Waiting ${delay}ms before next request...`);
+    await sleep(delay);
+  }
+
+  lastFetchTime = Date.now();
+  return fetch(url, options);
+};
+
+// --- Local Storage Helpers ---
+const PROXY_BASE = 'http://localhost:3005';
+
+const fetchFromStore = async (key: string): Promise<any | null> => {
+  try {
+    const res = await fetch(`${PROXY_BASE}/store/${key}`);
+    if (res.ok) {
+      return await res.json();
+    }
+  } catch (e) {
+    console.warn(`[Store] Failed to fetch ${key}:`, e);
+  }
+  return null;
+};
+
+const saveToStore = async (key: string, data: any) => {
+  try {
+    await fetch(`${PROXY_BASE}/store/${key}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data)
+    });
+    console.log(`[Store] Saved ${key}`);
+  } catch (e) {
+    console.error(`[Store] Failed to save ${key}:`, e);
+  }
+};
+
+export const refreshNovel = async (url: string): Promise<Novel> => {
+  return fetchNovelFromUrl(url, false, true);
+};
+
 // Simulate scraping a novel from a URL
-export const fetchNovelFromUrl = async (url: string, isRetry = false): Promise<Novel> => {
+export const fetchNovelFromUrl = async (url: string, isRetry = false, forceRefresh = false): Promise<Novel> => {
+
+  // Extract ID for storage key
+  const idMatch = url.match(/(\d+)-(.+)\.html/) || url.match(/\/(\d+)\//);
+  const id = idMatch ? idMatch[1] : 'unknown';
+  const storeKey = `novel_${id}`;
+
+  // 1. Try Local Store first (unless forcing refresh)
+  if (!forceRefresh && !isRetry) {
+    const cached = await fetchFromStore(storeKey);
+    if (cached) {
+      console.log(`[Store] Loaded from cache: ${storeKey}`);
+      return cached as Novel;
+    }
+  }
+
   await new Promise(resolve => setTimeout(resolve, 1500)); // Simulate network request
-  
+
   // Check if user has bypass token (but not on retry to avoid infinite loop)
   if (!isRetry) {
     const bypassToken = checkCloudflareBypass(url);
@@ -165,21 +279,21 @@ export const fetchNovelFromUrl = async (url: string, isRetry = false): Promise<N
 
     try {
       console.log(`[Proxy] Fetching URL: ${url}`);
-      
+
       // Try local proxy first, then fallback to public proxies
       const proxies = [
-        `http://localhost:3001/proxy?url=${encodeURIComponent(url)}`,
+        `http://localhost:3005/proxy?url=${encodeURIComponent(url)}`,
         `https://api.allorigins.win/get?url=${encodeURIComponent(url)}`
       ];
-      
+
       let html = '';
-      
+
       for (const proxyUrl of proxies) {
         try {
           console.log(`[Proxy] Trying: ${proxyUrl.split('?')[0]}`);
           // Simple request to avoid CORS preflight
           const response = await fetch(proxyUrl);
-          
+
           if (response.ok) {
             let testHtml = '';
             if (proxyUrl.includes('allorigins')) {
@@ -188,16 +302,22 @@ export const fetchNovelFromUrl = async (url: string, isRetry = false): Promise<N
             } else {
               testHtml = await response.text();
             }
-            
+
+            // Check if we got the app's own HTML (proxy failure)
+            if (testHtml.includes('<title>Lumia Reader</title>') || testHtml.includes('id="root"')) {
+              console.warn(`[Proxy] ${proxyUrl.split('?')[0]} returned app HTML (proxy not running?), trying next...`);
+              continue;
+            }
+
             // Test if this proxy bypassed Cloudflare
             const parser = new DOMParser();
             const testDoc = parser.parseFromString(testHtml, "text/html");
-            
+
             if (testDoc.title.includes("Just a moment") || testDoc.title.includes("Attention Required") || testHtml.includes('cf-browser-verification')) {
               console.warn(`[Proxy] ${proxyUrl.split('?')[0]} returned Cloudflare challenge, trying next...`);
               continue;
             }
-            
+
             html = testHtml;
             console.log(`[Proxy] Success with ${proxyUrl.split('?')[0]}`);
             break;
@@ -207,13 +327,13 @@ export const fetchNovelFromUrl = async (url: string, isRetry = false): Promise<N
           continue;
         }
       }
-      
+
       if (!html) {
         // Open page for manual Cloudflare bypass
         console.log('[Cloudflare] Opening page for manual bypass...');
-        
+
         const popup = window.open(url, 'cloudflareBypass', 'width=800,height=600');
-        
+
         alert(
           'Cloudflare protection detected!\n\n' +
           'A new window has opened. Please:\n' +
@@ -222,7 +342,7 @@ export const fetchNovelFromUrl = async (url: string, isRetry = false): Promise<N
           '3. Close the popup window\n\n' +
           'The import will retry automatically.'
         );
-        
+
         // Wait for user to close popup
         await new Promise((resolve) => {
           const checkInterval = setInterval(() => {
@@ -232,7 +352,7 @@ export const fetchNovelFromUrl = async (url: string, isRetry = false): Promise<N
             }
           }, 1000);
         });
-        
+
         // Retry with proxies after user completes challenge
         console.log('[Cloudflare] Retrying after manual bypass...');
         for (const proxyUrl of proxies) {
@@ -247,12 +367,12 @@ export const fetchNovelFromUrl = async (url: string, isRetry = false): Promise<N
             continue;
           }
         }
-        
+
         if (!html) {
           throw new Error('Cloudflare bypass failed - please try again');
         }
       }
-      
+
       console.log(`[Proxy] HTML received, length: ${html.length}`);
 
       if (html) {
@@ -340,19 +460,41 @@ export const fetchNovelFromUrl = async (url: string, isRetry = false): Promise<N
         }
 
         // Optional: Try to extract description too if we have the doc
-        const descMeta = doc.querySelector('meta[property="og:description"]');
-        if (descMeta) {
-          description = descMeta.getAttribute('content') || description;
+        // Strategy 1: Full description from .moreless__full (expanded content)
+        const fullDescDiv = doc.querySelector('.moreless__full');
+        if (fullDescDiv) {
+          // Remove the "Collapse" button text
+          const clonedDiv = fullDescDiv.cloneNode(true) as HTMLElement;
+          const collapseBtn = clonedDiv.querySelector('.moreless__toggle');
+          if (collapseBtn) collapseBtn.remove();
+
+          description = clonedDiv.textContent?.trim() || description;
+          console.log(`[Description Extraction] Found via .moreless__full`);
+        } else {
+          // Fallback to og:description
+          const descMeta = doc.querySelector('meta[property="og:description"]');
+          if (descMeta) {
+            description = descMeta.getAttribute('content') || description;
+            console.log(`[Description Extraction] Found via og:description`);
+          }
         }
 
         // --- Author Extraction ---
         try {
-          const authorXPath = "/html/body/div[1]/div/div/div[2]/div/article/div[2]/div[1]/div/div[1]/div[3]/div[1]/div[2]/ul[1]/li[7]/span/a";
-          const authorResult = doc.evaluate(authorXPath, doc, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
-          const authorElement = authorResult.singleNodeValue as HTMLElement;
-          if (authorElement) {
-            author = authorElement.textContent?.trim() || author;
-            console.log(`[Author Extraction] Found: ${author}`);
+          // Strategy 1: itemprop="creator" (more reliable)
+          const authorTag = doc.querySelector('.tag_list[itemprop="creator"] a, span[itemprop="creator"] a');
+          if (authorTag) {
+            author = authorTag.textContent?.trim() || author;
+            console.log(`[Author Extraction] Found via itemprop: ${author}`);
+          } else {
+            // Fallback to XPath
+            const authorXPath = "/html/body/div[1]/div/div/div[2]/div/article/div[2]/div[1]/div/div[1]/div[3]/div[1]/div[2]/ul[1]/li[7]/span/a";
+            const authorResult = doc.evaluate(authorXPath, doc, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
+            const authorElement = authorResult.singleNodeValue as HTMLElement;
+            if (authorElement) {
+              author = authorElement.textContent?.trim() || author;
+              console.log(`[Author Extraction] Found via XPath: ${author}`);
+            }
           }
         } catch (e) {
           console.warn("[Author Extraction] Error:", e);
@@ -413,13 +555,16 @@ export const fetchNovelFromUrl = async (url: string, isRetry = false): Promise<N
 
           // Create a proxy function using local proxy
           const proxyFn = async (url: string) => {
-            const response = await fetch(`http://localhost:3001/proxy?url=${encodeURIComponent(url)}`);
+            const response = await fetch(`http://localhost:3005/proxy?url=${encodeURIComponent(url)}`);
             if (response.ok) {
               const data = await response.json();
               return {
                 ok: true,
-                text: () => Promise.resolve(data.contents)
-              };
+                text: () => Promise.resolve(data.contents),
+                json: () => Promise.resolve(data),
+                status: 200,
+                headers: new Headers(),
+              } as unknown as Response;
             }
             throw new Error('Chapter proxy failed');
           };
@@ -459,7 +604,7 @@ export const fetchNovelFromUrl = async (url: string, isRetry = false): Promise<N
     // STASH to Local Storage (Simulating persistence)
     localStorage.setItem(`lumina_toc_${id}`, JSON.stringify(toc));
 
-    return {
+    const novelData: Novel = {
       id: id,
       title: title,
       author: author,
@@ -470,6 +615,15 @@ export const fetchNovelFromUrl = async (url: string, isRetry = false): Promise<N
       totalChapters: totalChapters,
       rating: rating
     };
+
+    // Save novel data with chapters to store
+    const novelWithChapters = {
+      ...novelData,
+      chapters: toc // Include chapter links
+    };
+    await saveToStore(storeKey, novelWithChapters);
+
+    return novelData;
   }
 
   // Fallback for other URLs
@@ -503,7 +657,20 @@ export const fetchChapter = async (chapterNumber: number, novelId?: string): Pro
   let chapterUrl = '';
 
   if (novelId) {
-    // 1. Check Local Storage for TOC to get the chapter URL
+    // 1. Try to load from storage first
+    const chapterStoreKey = `chapter_${novelId}_${chapterNumber}`;
+    const cachedChapter = await fetchFromStore(chapterStoreKey);
+
+    if (cachedChapter) {
+      console.log(`[Chapter] Loaded from cache: ${chapterStoreKey}`);
+      // Trigger background prefetch for next chapters
+      prefetchChapters(novelId, chapterNumber + 1, 3).catch(e =>
+        console.warn('[Prefetch] Error:', e)
+      );
+      return cachedChapter as Chapter;
+    }
+
+    // 2. Check Local Storage for TOC to get the chapter URL
     const storedToc = localStorage.getItem(`lumina_toc_${novelId}`);
     if (storedToc) {
       try {
@@ -518,39 +685,24 @@ export const fetchChapter = async (chapterNumber: number, novelId?: string): Pro
       }
     }
 
-    // 2. If we have a chapter URL, fetch the actual content
+    // 3. If we have a chapter URL, fetch the actual content
     if (chapterUrl && chapterUrl.includes('ranobes.net')) {
       try {
         console.log(`[Chapter Fetch] Fetching chapter from: ${chapterUrl}`);
-        
-        const proxies = [
-          `http://localhost:3001/proxy?url=${encodeURIComponent(chapterUrl)}`
-        ];
-        
-        let html = '';
-        
-        for (const proxyUrl of proxies) {
-          try {
-            const response = await fetch(proxyUrl);
-            
-            if (response.ok) {
-              const data = await response.json();
-              html = data.contents;
-              break;
-            }
-          } catch (e) {
-            continue;
-          }
-        }
 
-        if (html) {
+        const proxyUrl = `http://localhost:3005/proxy?url=${encodeURIComponent(chapterUrl)}`;
+        const response = await rateLimitedFetch(proxyUrl);
+
+        if (response.ok) {
+          const data = await response.json();
+          const html = data.contents;
+
           const parser = new DOMParser();
           const doc = parser.parseFromString(html, "text/html");
 
           // Extract title from h1.title
           const titleElement = doc.querySelector('h1.title[itemprop="headline"]');
           if (titleElement) {
-            // Get just the chapter title, remove the novel name part
             const fullTitle = titleElement.textContent?.trim() || '';
             const titleParts = fullTitle.split('|');
             title = titleParts[0]?.trim() || title;
@@ -560,16 +712,14 @@ export const fetchChapter = async (chapterNumber: number, novelId?: string): Pro
           // Extract content from div.text#arrticle
           const contentElement = doc.querySelector('div.text#arrticle');
           if (contentElement) {
-            // Get all paragraphs, filtering out ads and scripts
             const paragraphs = contentElement.querySelectorAll('p');
             content = Array.from(paragraphs)
               .map(p => p.textContent?.trim() || '')
               .filter(text => {
-                // Filter out empty paragraphs and ad-related content
                 return text.length > 0 &&
                   !text.includes('data-cfasync') &&
                   !text.includes('script') &&
-                  text.length > 10; // Minimum length to avoid ad fragments
+                  text.length > 10;
               });
 
             console.log(`[Chapter Fetch] Extracted ${content.length} paragraphs`);
@@ -581,18 +731,58 @@ export const fetchChapter = async (chapterNumber: number, novelId?: string): Pro
     }
   }
 
-  // If no content was fetched, show a message instead of placeholder
+  // If no content was fetched, show a message
   if (content.length === 0) {
     content = ["Unable to load chapter content. Please check your connection or try again later."];
   }
 
-  return {
+  const chapter: Chapter = {
     id: `ch-${chapterNumber}`,
     number: chapterNumber,
     title: title,
     content: content,
     comments: generateComments(3 + Math.floor(Math.random() * 5))
   };
+
+  // Save to storage if we fetched real content
+  if (novelId && content.length > 1) {
+    const chapterStoreKey = `chapter_${novelId}_${chapterNumber}`;
+    await saveToStore(chapterStoreKey, chapter);
+
+    // Trigger background prefetch for next chapters
+    prefetchChapters(novelId, chapterNumber + 1, 3).catch(e =>
+      console.warn('[Prefetch] Error:', e)
+    );
+  }
+
+  return chapter;
+};
+
+// Background prefetch for upcoming chapters
+const prefetchChapters = async (novelId: string, startNum: number, count: number): Promise<void> => {
+  console.log(`[Prefetch] Starting prefetch for chapters ${startNum}-${startNum + count - 1}`);
+
+  for (let i = 0; i < count; i++) {
+    const chapterNum = startNum + i;
+    const chapterStoreKey = `chapter_${novelId}_${chapterNum}`;
+
+    // Skip if already cached
+    const cached = await fetchFromStore(chapterStoreKey);
+    if (cached) {
+      console.log(`[Prefetch] Chapter ${chapterNum} already cached, skipping`);
+      continue;
+    }
+
+    // Fetch in background
+    try {
+      console.log(`[Prefetch] Fetching chapter ${chapterNum}...`);
+      await fetchChapter(chapterNum, novelId);
+    } catch (e) {
+      console.warn(`[Prefetch] Failed to prefetch chapter ${chapterNum}:`, e);
+    }
+  }
+
+  console.log(`[Prefetch] Completed prefetch`);
 };
 
 export const fetchTOC = async (novelId?: string): Promise<TOCItem[]> => {
@@ -613,3 +803,4 @@ export const fetchTOC = async (novelId?: string): Promise<TOCItem[]> => {
     title: TITLES[i % TITLES.length]
   }));
 };
+

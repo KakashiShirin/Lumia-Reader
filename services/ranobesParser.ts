@@ -94,8 +94,11 @@ export async function fetchAllRanobesChapters(
         const firstPageData = extractRanobesData(firstPageHtml);
 
         if (!firstPageData) {
-            console.warn('[Ranobes Parser] Could not extract data from first page');
-            return [];
+            console.warn('[Ranobes Parser] Could not extract data from first page, trying HTML fallback');
+            // Parse from the HTML we already have
+            const parser = new DOMParser();
+            const doc = parser.parseFromString(firstPageHtml, "text/html");
+            return parseChaptersFromHTML(doc);
         }
 
         console.log(`[Ranobes Parser] Found ${firstPageData.count_all} total chapters across ${firstPageData.pages_count} pages`);
