@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "cors": "^2.8.5",
+    "epubjs": "^0.3.93",
     "express": "^5.1.0",
     "lucide-react": "^0.554.0",
     "node-fetch": "^3.3.2",

@@ -23,6 +23,8 @@ export const NovelDetails: React.FC<NovelDetailsProps> = ({
   onToggleBookmark,
   onUpdateNovel
 }) => {
+  if (!novel) return null;
+
   const [chapters, setChapters] = useState<TOCItem[]>([]);
   const [search, setSearch] = useState('');
   const [loading, setLoading] = useState(true);
@@ -40,12 +42,24 @@ export const NovelDetails: React.FC<NovelDetailsProps> = ({
   React.useEffect(() => {
     const load = async () => {
       setLoading(true);
-      const data = await fetchTOC(novel.id);
-      setChapters(data);
-      setLoading(false);
+      try {
+        let data: TOCItem[] = [];
+        // Check if local book (no sourceUrl or ID starts with local-)
+        if (!novel.sourceUrl || novel.id.startsWith('local-')) {
+          const { localReader } = await import('../services/LocalReaderService');
+          data = await localReader.getTOC(novel.id);
+        } else {
+          data = await fetchTOC(novel.id);
+        }
+        setChapters(data);
+      } catch (e) {
+        console.error("Failed to load chapters:", e);
+      } finally {
+        setLoading(false);
+      }
     };
     load();
-  }, [novel.id]);
+  }, [novel.id, novel.sourceUrl]);
 
   const handleRefresh = async () => {
     if (!novel.sourceUrl) return;
@@ -121,7 +135,7 @@ export const NovelDetails: React.FC<NovelDetailsProps> = ({
 
           {/* Background Blur Effect */}
           <div className="absolute inset-0 overflow-hidden opacity-10 pointer-events-none sticky-top-0">
-            <img src={displayCover} className="w-full h-full object-cover blur-3xl scale-150" />
+            {displayCover && <img src={displayCover} className="w-full h-full object-cover blur-3xl scale-150" />}
           </div>
 
           <div className="relative z-10 p-6 flex-1">
@@ -157,7 +171,13 @@ export const NovelDetails: React.FC<NovelDetailsProps> = ({
 
             {/* Cover Image */}
             <div className="aspect-[2/3] w-48 sm:w-56 mx-auto rounded-xl shadow-2xl overflow-hidden mb-8 border border-white/10 group relative">
-              <img src={displayCover} alt={displayTitle} className="w-full h-full object-cover shadow-inner" />
+              {displayCover ? (
+                <img src={displayCover} alt={displayTitle} className="w-full h-full object-cover shadow-inner" />
+              ) : (
+                <div className="w-full h-full bg-white/5 flex items-center justify-center text-gray-600">
+                  <FolderInput size={48} />
+                </div>
+              )}
               {isEditing && (
                 <div className="absolute inset-0 bg-black/80 flex flex-col items-center justify-center p-4 gap-2">
                   <span className="text-xs font-bold text-gray-400 uppercase">Cover URL</span>

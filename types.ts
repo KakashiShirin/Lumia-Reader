@@ -20,6 +20,7 @@ export interface TOCItem {
   number: number;
   title: string;
   url?: string;
+  id?: string;
 }
 
 export interface UserStats {
@@ -53,6 +54,8 @@ export interface Novel {
   title: string;
   author: string;
   coverUrl: string;
+  customTitle?: string;
+  customCoverUrl?: string;
   description: string;
   tags: string[];
   status: 'Ongoing' | 'Completed' | 'Hiatus' | 'Dropped';
